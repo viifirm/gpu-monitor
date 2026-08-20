@@ -21,7 +21,7 @@ WARNING_THRESHOLD = 75
 DANGER_THRESHOLD = 90
 GPU_POWER_LIMIT = None # Auto-detect
 
-# Colors compliant with your frontend expectations
+# Colors
 COLORS = {
     "safe": "#76b900",
     "warning": "#ffcc00",
@@ -36,15 +36,16 @@ app = Flask(__name__)
 
 class AdvancedSystemMonitor:
     def __init__(self):
-        # OPTIMIZATION: Use deque for O(1) performance on rolling buffers
         self.history = {
-            "gpu_util": collections.deque([0]*HISTORY_SIZE, maxlen=HISTORY_SIZE),
             "cpu_util": collections.deque([0]*HISTORY_SIZE, maxlen=HISTORY_SIZE),
-            "ram_util": collections.deque([0]*HISTORY_SIZE, maxlen=HISTORY_SIZE)
+            "ram_util": collections.deque([0]*HISTORY_SIZE, maxlen=HISTORY_SIZE),
         }
+        # Per-GPU history
+        self.gpu_history = {}  # {gpu_index: deque}
+
         self.has_gpu = False
-        self.gpu_handle = None
-        self.gpu_name = "N/A"
+        self.gpu_handles = []
+        self.gpu_names = []
         self.driver_version = "N/A"
         self.cpu_model = "Unknown CPU"
 
@@ -53,12 +54,22 @@ class AdvancedSystemMonitor:
 
     def _init_cpu_info(self):
         try:
-            with open('/proc/cpuinfo', 'r') as f:
-                for line in f:
-                    if "model name" in line:
-                        raw_name = line.split(":")[1].strip()
-                        self.cpu_model = raw_name.replace("(R)", "").replace("(TM)", "").replace(" CPU", "")
-                        break
+            if platform.system() == "Windows":
+                import subprocess
+                result = subprocess.run(
+                    ['wmic', 'cpu', 'get', 'name'],
+                    capture_output=True, text=True, check=True
+                )
+                lines = result.stdout.strip().split('\n')
+                if len(lines) >= 2:
+                    self.cpu_model = lines[1].strip()
+            else:
+                with open('/proc/cpuinfo', 'r') as f:
+                    for line in f:
+                        if "model name" in line:
+                            raw_name = line.split(":")[1].strip()
+                            self.cpu_model = raw_name.replace("(R)", "").replace("(TM)", "").replace(" CPU", "")
+                            break
         except Exception:
             self.cpu_model = platform.processor()
 
@@ -66,14 +77,24 @@ class AdvancedSystemMonitor:
         if HAS_NVIDIA_LIB:
             try:
                 pynvml.nvmlInit()
-                self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                self.gpu_name = pynvml.nvmlDeviceGetName(self.gpu_handle)
-                if isinstance(self.gpu_name, bytes): 
-                    self.gpu_name = self.gpu_name.decode('utf-8')
-                self.driver_version = pynvml.nvmlSystemGetDriverVersion()
-                if isinstance(self.driver_version, bytes): 
-                    self.driver_version = self.driver_version.decode('utf-8')
-                self.has_gpu = True
+                device_count = pynvml.nvmlDeviceGetCount()
+                print(f"[GPU] Total {device_count} GPUs detected.")
+
+                if device_count > 0:
+                    for i in range(device_count):
+                        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                        name = pynvml.nvmlDeviceGetName(handle)
+                        if isinstance(name, bytes):
+                            name = name.decode('utf-8')
+                        self.gpu_handles.append(handle)
+                        self.gpu_names.append(name)
+                        self.gpu_history[i] = collections.deque([0]*HISTORY_SIZE, maxlen=HISTORY_SIZE)
+                        print(f"[GPU] GPU {i}: {name}")
+
+                    self.driver_version = pynvml.nvmlSystemGetDriverVersion()
+                    if isinstance(self.driver_version, bytes):
+                        self.driver_version = self.driver_version.decode('utf-8')
+                    self.has_gpu = True
             except Exception as e:
                 print(f"NVIDIA GPU initialization failed: {e}")
 
@@ -82,26 +103,112 @@ class AdvancedSystemMonitor:
         try:
             for p in psutil.process_iter(['pid', 'name', 'username', 'memory_percent', 'cpu_percent']):
                 try:
-                    # Optimization: Filter early
                     if p.info['memory_percent'] > 0.1 or p.info['cpu_percent'] > 0.1:
                         procs.append(p.info)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
         except Exception:
             pass
-        # Sort in place is faster
         procs.sort(key=lambda x: x['memory_percent'], reverse=True)
         return procs[:limit]
 
+    def get_gpu_stats(self):
+        gpu_list = []
+
+        if not self.has_gpu or not self.gpu_handles:
+            return {"available": False, "count": 0, "driver": "N/A", "devices": []}
+
+        for idx, handle in enumerate(self.gpu_handles):
+            gpu_data = {
+                "index": idx,
+                "name": self.gpu_names[idx] if idx < len(self.gpu_names) else "N/A",
+                "available": False,
+                "utilization": 0,
+                "history": [0]*HISTORY_SIZE,
+                "vram_percent": 0,
+                "vram_used_gb": 0,
+                "vram_total_gb": 0,
+                "temp_c": 0,
+                "fan_percent": 0,
+                "power_w": 0,
+                "power_limit_w": 0,
+                "pcie_tx_mb": 0,
+                "pcie_rx_mb": 0
+            }
+
+            try:
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+                # Update per-GPU history
+                self.gpu_history[idx].append(util.gpu)
+
+                gpu_data.update({
+                    "available": True,
+                    "utilization": util.gpu,
+                    "history": list(self.gpu_history[idx]),
+                    "vram_percent": round((mem.used / mem.total) * 100, 1),
+                    "vram_used_gb": round(mem.used / (1024**3), 1),
+                    "vram_total_gb": round(mem.total / (1024**3), 0),
+                })
+
+                try:
+                    gpu_data["temp_c"] = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                except:
+                    pass
+
+                try:
+                    gpu_data["fan_percent"] = pynvml.nvmlDeviceGetFanSpeed(handle)
+                except:
+                    pass
+
+                try:
+                    power_w = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+                    if GPU_POWER_LIMIT is not None:
+                        power_lim = GPU_POWER_LIMIT
+                    else:
+                        power_lim = pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0
+                    gpu_data["power_w"] = round(power_w, 0)
+                    gpu_data["power_limit_w"] = round(power_lim, 0)
+                except:
+                    pass
+
+                try:
+                    tx = pynvml.nvmlDeviceGetPcieThroughput(handle, pynvml.NVML_PCIE_UTIL_TX_BYTES) / (1024**2)
+                    rx = pynvml.nvmlDeviceGetPcieThroughput(handle, pynvml.NVML_PCIE_UTIL_RX_BYTES) / (1024**2)
+                    gpu_data["pcie_tx_mb"] = round(tx, 0)
+                    gpu_data["pcie_rx_mb"] = round(rx, 0)
+                except:
+                    pass
+
+            except Exception as e:
+                print(f"[GPU] GPU {idx} read error: {e}")
+
+            gpu_list.append(gpu_data)
+
+        return {
+            "available": len(gpu_list) > 0,
+            "count": len(gpu_list),
+            "driver": self.driver_version,
+            "devices": gpu_list
+        }
+
     def get_full_stats(self):
-        # Non-blocking calls
+        # IMPORTANT: psutil.cpu_percent must be called with interval=None for non-blocking reads
         cpu_global = psutil.cpu_percent(interval=None)
         cpu_cores = psutil.cpu_percent(interval=None, percpu=True)
         ram = psutil.virtual_memory()
         swap = psutil.swap_memory()
-        disk = psutil.disk_usage('/')
 
-        # Deque handles rotation automatically (O(1))
+        try:
+            if platform.system() == "Windows":
+                disk = psutil.disk_usage('C:\\')
+            else:
+                disk = psutil.disk_usage('/')
+        except Exception:
+            disk = type('obj', (object,), {'percent': 0, 'used': 0, 'total': 0})()
+
+        # Update history deques
         self.history["cpu_util"].append(cpu_global)
         self.history["ram_util"].append(ram.percent)
 
@@ -110,7 +217,7 @@ class AdvancedSystemMonitor:
             "cpu": {
                 "model": self.cpu_model,
                 "global_usage": cpu_global,
-                "history": list(self.history["cpu_util"]), # Convert deque to list for JSON
+                "history": list(self.history["cpu_util"]),
                 "cores": cpu_cores,
                 "count_physical": psutil.cpu_count(logical=False),
                 "count_logical": psutil.cpu_count(logical=True)
@@ -130,58 +237,14 @@ class AdvancedSystemMonitor:
                  "root_total_gb": round(disk.total / (1024**3), 0),
             },
             "processes": self.get_top_processes(),
-            "gpu": {"available": False}
+            "gpu": self.get_gpu_stats()
         }
-
-        if self.has_gpu:
-            try:
-                util = pynvml.nvmlDeviceGetUtilizationRates(self.gpu_handle)
-                mem = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
-                temp = pynvml.nvmlDeviceGetTemperature(self.gpu_handle, pynvml.NVML_TEMPERATURE_GPU)
-                fan = pynvml.nvmlDeviceGetFanSpeed(self.gpu_handle)
-                
-                try:
-                    power_w = pynvml.nvmlDeviceGetPowerUsage(self.gpu_handle) / 1000.0
-                    if GPU_POWER_LIMIT is not None:
-                        power_lim = GPU_POWER_LIMIT
-                    else:
-                        power_lim = pynvml.nvmlDeviceGetEnforcedPowerLimit(self.gpu_handle) / 1000.0
-                except Exception:
-                    power_w, power_lim = 0, 0
-                
-                try:
-                    tx = pynvml.nvmlDeviceGetPcieThroughput(self.gpu_handle, pynvml.NVML_PCIE_UTIL_TX_BYTES) / (1024**2)
-                    rx = pynvml.nvmlDeviceGetPcieThroughput(self.gpu_handle, pynvml.NVML_PCIE_UTIL_RX_BYTES) / (1024**2)
-                except Exception:
-                    tx, rx = 0, 0
-
-                self.history["gpu_util"].append(util.gpu)
-
-                stats["gpu"] = {
-                    "available": True,
-                    "name": self.gpu_name,
-                    "driver": self.driver_version,
-                    "utilization": util.gpu,
-                    "history": list(self.history["gpu_util"]),
-                    "vram_percent": round((mem.used / mem.total) * 100, 1),
-                    "vram_used_gb": round(mem.used / (1024**3), 1),
-                    "vram_total_gb": round(mem.total / (1024**3), 0),
-                    "temp_c": temp,
-                    "fan_percent": fan,
-                    "power_w": round(power_w, 0),
-                    "power_limit_w": round(power_lim, 0),
-                    "pcie_tx_mb": round(tx, 0),
-                    "pcie_rx_mb": round(rx, 0)
-                }
-            except Exception:
-                 # If GPU fails mid-operation, mark unavailable but don't crash
-                 self.has_gpu = False
 
         return stats
 
 monitor = AdvancedSystemMonitor()
 
-# --- FRONTEND (EXACTLY AS PROVIDED) ---
+# --- FRONTEND ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -200,7 +263,7 @@ HTML_TEMPLATE = """
             --text-dim: #888888;
             --danger: #ff3333;
         }
-        * { box-sizing: border-box; } 
+        * { box-sizing: border-box; }
         body {
             background-color: var(--bg-main);
             color: var(--text-bright);
@@ -209,17 +272,18 @@ HTML_TEMPLATE = """
             padding: 20px;
             overflow-x: hidden;
         }
-        
+
         /* HEADER */
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 0 10px;}
         .header h1 { margin: 0; font-size: 1.5rem; text-transform: uppercase; letter-spacing: 2px;}
         .header .sub-info { font-size: 0.8rem; color: var(--text-dim); text-align: right;}
 
+        /* GRID LAYOUT */
         .dashboard-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 25px;
-            max-width: 1400px;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            max-width: 1800px;
             margin: 0 auto;
             width: 100%;
         }
@@ -227,66 +291,121 @@ HTML_TEMPLATE = """
         .card {
             background-color: var(--bg-card);
             border-radius: 8px;
-            padding: 25px;
+            padding: 20px;
             box-shadow: 0 8px 16px rgba(0,0,0,0.4);
             border: 1px solid #222;
             display: flex;
             flex-direction: column;
         }
-        
+
         .card-header {
             display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 20px; border-bottom: 1px solid #222; padding-bottom: 10px;
+            margin-bottom: 15px; border-bottom: 1px solid #222; padding-bottom: 10px;
         }
-        .card-title { font-size: 1.1rem; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); white-space: nowrap;}
-        
-        /* Subtitle aligné à droite et propre */
-        .card-subtitle { font-size: 0.9rem; color: var(--nvidia-green); font-weight: bold; text-align: right;}
+        .card-title { font-size: 0.9rem; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); white-space: nowrap;}
+        .card-subtitle { font-size: 0.85rem; color: var(--nvidia-green); font-weight: bold; text-align: right;}
 
-        .split-layout { display: flex; justify-content: space-between; align-items: center; height: 100%;}
-        .gauge-side { width: 40%; display: flex; flex-direction: column; align-items: center; position: relative;}
-        
-        .big-value-container { position: absolute; top: 55%; left: 50%; transform: translate(-50%, -50%); text-align: center;}
-        .big-value { font-size: 2.5rem; font-weight: 800; line-height: 1;}
-        .big-unit { font-size: 1.2rem; color: var(--nvidia-green); }
-        .sub-value { font-size: 0.9rem; color: var(--text-dim); margin-top: 5px;}
+        /* GAUGE LAYOUT */
+        .gauge-container {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .gauge-wrapper {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: relative;
+        }
+        .gauge-wrapper canvas.gauge { width: 140px; height: 140px; }
+        .big-value-container {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+        }
+        .big-value {
+            font-size: 2rem;
+            font-weight: 300;
+            line-height: 1;
+        }
+        .gpu-big-value {
+            font-size: 2rem;
+            font-weight: 300;
+            line-height: 1;
+        }
+        .big-unit { font-size: 1rem; color: var(--nvidia-green); }
+        .sub-value { font-size: 0.75rem; color: var(--text-dim); margin-top: 3px;}
 
-        canvas.gauge { width: 180px; height: 180px; }
-        canvas.graph { width: 100%; height: 100px; }
-        .graph-label {font-size: 0.75rem; color: var(--text-dim); margin-bottom: 5px; text-transform: uppercase;}
+        /* GRAPHS */
+        canvas.graph { width: 100%; height: 80px; }
+        .graph-label {font-size: 0.7rem; color: var(--text-dim); margin-bottom: 5px; text-transform: uppercase;}
 
-        .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 15px;}
-        .metric-box { background: #1a1a1a; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #2a2a2a;}
-        .metric-box .label { font-size: 0.7rem; color: var(--text-dim); display: block; margin-bottom: 5px;}
-        .metric-box .value { font-size: 1.2rem; font-weight: bold; color: var(--text-bright);}
-        .metric-box .unit { font-size: 0.8rem; color: var(--nvidia-green);}
+        /* METRICS GRID */
+        .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px;}
+        .metric-box { background: #1a1a1a; padding: 8px 5px; border-radius: 6px; text-align: center; border: 1px solid #2a2a2a;}
+        .metric-box .label { font-size: 0.65rem; color: var(--text-dim); display: block; margin-bottom: 3px;}
+        .metric-box .value { font-size: 1rem; font-weight: bold; color: var(--text-bright);}
+        .metric-box .unit { font-size: 0.7rem; color: var(--nvidia-green);}
 
+        /* CPU CORES */
         .cpu-cores-grid {
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
-            gap: 4px; margin-top: 15px; height: 80px;
+            display: flex;
+            gap: 2px;
+            margin-top: 15px;
+            height: 60px;
+            width: 100%;
+            overflow-x: auto;
+            flex-wrap: nowrap;
         }
-        .core-bar-container { background-color: #111; height: 100%; width: 100%; position: relative; overflow: hidden;}
+        .core-bar-container {
+            background-color: #111;
+            height: 100%;
+            min-width: 4px;
+            flex: 1 1 0;
+            position: relative;
+            overflow: hidden;
+        }
+        .core-bar-fill {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background-color: var(--nvidia-green);
+            transition: height 0.3s ease;
+        }
+        .core-bar-container { background-color: #111; height: 100%; width: 100%; position: relative; overflow: hidden; border-radius: 2px;}
         .core-bar-fill { position: absolute; bottom: 0; left:0; width: 100%; background-color: var(--nvidia-green); transition: height 0.3s ease;}
-        
-        .storage-section { margin-top: 20px; display: flex; gap: 20px;}
-        .mini-gauge-container { text-align: center; width: 50%; background: #1a1a1a; padding: 15px; border-radius: 8px;}
 
-        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 10px; }
-        th { text-align: left; color: var(--text-dim); border-bottom: 1px solid #333; padding: 8px 0; font-size: 0.75rem;}
-        td { padding: 6px 0; border-bottom: 1px solid #222; }
+        /* STORAGE */
+        .storage-section { margin-top: 15px; display: flex; gap: 15px;}
+        .mini-gauge-container { text-align: center; flex: 1; background: #1a1a1a; padding: 12px; border-radius: 8px;}
+        .mini-gauge-container canvas.gauge { width: 100px; height: 100px; }
+
+        /* TABLE */
+        table { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 10px; }
+        th { text-align: left; color: var(--text-dim); border-bottom: 1px solid #333; padding: 6px 0; font-size: 0.7rem;}
+        td { padding: 5px 0; border-bottom: 1px solid #222; }
         .proc-mem { color: var(--nvidia-green); font-weight: bold; }
         .proc-name { color: #fff; }
 
+        /* GPU CARDS */
+        .gpu-card { grid-column: span 1; }
+        .gpu-card .gauge-wrapper canvas.gauge { width: 120px; height: 120px; }
+
+        @media (max-width: 1200px) {
+            .dashboard-grid { grid-template-columns: repeat(2, 1fr); }
+        }
         @media (max-width: 768px) {
-            body { padding: 10px; } 
+            body { padding: 10px; }
             .dashboard-grid { grid-template-columns: 1fr; }
             .card-header { flex-direction: column; align-items: flex-start; gap: 5px; }
-            .card-subtitle { text-align: left; margin-top: 2px; word-break: break-word; }
-            .split-layout { flex-direction: column; }
-            .gauge-side { width: 100%; margin-bottom: 20px;}
-            .big-value-container { position: static; transform: none; margin-top: -40px; margin-bottom: 20px;}
+            .card-subtitle { text-align: left; }
+            .gauge-container { flex-direction: column; }
             .metrics-grid { grid-template-columns: repeat(2, 1fr); }
-            .card { padding: 15px; }
         }
     </style>
 </head>
@@ -297,112 +416,61 @@ HTML_TEMPLATE = """
         <div class="sub-info" id="osInfo">Initializing...</div>
     </div>
 
-    <div class="dashboard-grid">
-        
-        <div class="card" id="gpuCard">
-            <div class="card-header">
-                <span class="card-title">GPU Accelerator</span>
-                <span class="card-subtitle" id="gpuName">No GPU Detected</span>
-            </div>
-            <div class="split-layout">
-                <div class="gauge-side">
-                    <canvas id="gpuUtilGauge" class="gauge" width="180" height="180"></canvas>
-                    <div class="big-value-container">
-                        <span class="big-value" id="gpuUtilVal">0</span><span class="big-unit">%</span>
-                        <div class="sub-value">Compute Load</div>
-                    </div>
-                </div>
-                <div class="gauge-side">
-                     <canvas id="vramGauge" class="gauge" width="180" height="180"></canvas>
-                     <div class="big-value-container">
-                         <span class="big-value" id="vramVal">0</span><span class="big-unit">GB</span>
-                         <div class="sub-value" id="vramTotal">of 0 GB</div>
-                     </div>
-                </div>
-            </div>
-            <div class="metrics-grid">
-                <div class="metric-box">
-                    <span class="label">TEMP</span>
-                    <span class="value" id="gpuTemp">0</span><span class="unit">°C</span>
-                </div>
-                <div class="metric-box">
-                    <span class="label">POWER</span>
-                    <span class="value" id="gpuPower">0</span><span class="unit">W</span>
-                </div>
-                 <div class="metric-box">
-                    <span class="label">FAN</span>
-                    <span class="value" id="gpuFan">0</span><span class="unit">%</span>
-                </div>
-                 <div class="metric-box">
-                    <span class="label">DRIVER</span>
-                    <span class="value" style="font-size: 0.9rem;" id="gpuDriver">N/A</span>
-                </div>
-                <div class="metric-box">
-                    <span class="label">PCIe TX</span>
-                    <span class="value" id="pcieTx">0</span><span class="unit">MB/s</span>
-                </div>
-                <div class="metric-box">
-                    <span class="label">PCIe RX</span>
-                    <span class="value" id="pcieRx">0</span><span class="unit">MB/s</span>
-                </div>
-            </div>
-             <div style="margin-top:15px;">
-                 <div class="graph-label">GPU Load History (60s)</div>
-                 <canvas id="gpuGraph" class="graph" width="400" height="100"></canvas>
-             </div>
-        </div>
+    <div class="dashboard-grid" id="dashboard">
 
-        <div class="card">
-             <div class="card-header">
+        <!-- CPU & MEMORY CARD -->
+        <div class="card" id="cpuCard">
+            <div class="card-header">
                 <span class="card-title">Processor & Memory</span>
                 <span class="card-subtitle" id="cpuCountInfo">Cores</span>
             </div>
-             <div class="split-layout">
-                <div class="gauge-side">
-                    <canvas id="cpuGauge" class="gauge" width="180" height="180"></canvas>
+            <div class="gauge-container">
+                <div class="gauge-wrapper">
+                    <canvas id="cpuGauge" class="gauge" width="140" height="140"></canvas>
                     <div class="big-value-container">
                         <span class="big-value" id="cpuVal">0</span><span class="big-unit">%</span>
                         <div class="sub-value">Global Load</div>
                     </div>
                 </div>
-                 <div class="gauge-side">
-                    <canvas id="ramGauge" class="gauge" width="180" height="180"></canvas>
+                <div class="gauge-wrapper">
+                    <canvas id="ramGauge" class="gauge" width="140" height="140"></canvas>
                     <div class="big-value-container">
                         <span class="big-value" id="ramVal">0</span><span class="big-unit">GB</span>
-                        <div class="sub-value" id="ramTotal">of 0 GB RAM</div>
+                        <div class="sub-value" id="ramTotal">of 0 GB</div>
                     </div>
                 </div>
             </div>
-             <div style="margin-top:15px;">
-                 <div class="graph-label">CPU History (60s)</div>
-                 <canvas id="cpuGraph" class="graph" width="400" height="80"></canvas>
-             </div>
-            <div style="margin-top: 20px;">
-                 <div class="graph-label" style="margin-bottom: 5px;">Logical Core Load</div>
-                 <div id="cpuCoresContainer" class="cpu-cores-grid"></div>
+            <div style="margin-top:12px;">
+                <div class="graph-label">CPU History (60s)</div>
+                <canvas id="cpuGraph" class="graph" width="400" height="80"></canvas>
+            </div>
+            <div style="margin-top: 12px;">
+                <div class="graph-label" style="margin-bottom: 5px;">Logical Core Load</div>
+                <div id="cpuCoresContainer" class="cpu-cores-grid"></div>
             </div>
         </div>
 
-         <div class="card">
+        <!-- STORAGE & PROCESSES CARD -->
+        <div class="card" id="storageCard">
             <div class="card-header">
                 <span class="card-title">Storage & Processes</span>
             </div>
             <div class="storage-section">
                 <div class="mini-gauge-container">
-                     <div class="graph-label">Main SSD (/)</div>
-                     <canvas id="ssdGauge" class="gauge" width="120" height="120" style="width:120px; height:120px;"></canvas>
-                     <div style="font-size:1.2rem; font-weight:bold;"><span id="ssdVal">0</span>%</div>
-                     <div class="sub-value"><span id="ssdUsed">0</span> / <span id="ssdTotal">0</span> GB</div>
+                    <div class="graph-label">Main SSD</div>
+                    <canvas id="ssdGauge" class="gauge" width="100" height="100"></canvas>
+                    <div style="font-size:1.1rem; font-weight:bold; margin-top:5px;"><span id="ssdVal">0</span>%</div>
+                    <div class="sub-value"><span id="ssdUsed">0</span> / <span id="ssdTotal">0</span> GB</div>
                 </div>
                 <div class="mini-gauge-container">
-                     <div class="graph-label">Swap Mem</div>
-                     <canvas id="swapGauge" class="gauge" width="120" height="120" style="width:120px; height:120px;"></canvas>
-                     <div style="font-size:1.2rem; font-weight:bold;"><span id="swapVal">0</span>%</div>
-                     <div class="sub-value"><span id="swapUsed">0</span> / <span id="swapTotal">0</span> GB</div>
+                    <div class="graph-label">Swap Mem</div>
+                    <canvas id="swapGauge" class="gauge" width="100" height="100"></canvas>
+                    <div style="font-size:1.1rem; font-weight:bold; margin-top:5px;"><span id="swapVal">0</span>%</div>
+                    <div class="sub-value"><span id="swapUsed">0</span> / <span id="swapTotal">0</span> GB</div>
                 </div>
             </div>
-            <div style="margin-top: 25px; border-top: 1px solid #222; padding-top: 15px;">
-                <span class="card-title" style="font-size: 0.9rem;">Top Resource Consumers</span>
+            <div style="margin-top: 20px; border-top: 1px solid #222; padding-top: 12px;">
+                <span class="card-title" style="font-size: 0.8rem;">Top Resource Consumers</span>
                 <table>
                     <thead>
                         <tr>
@@ -415,8 +483,11 @@ HTML_TEMPLATE = """
                     <tbody id="procTable"></tbody>
                 </table>
             </div>
-         </div>
-    </div> 
+        </div>
+
+        <!-- GPU CARDS will be dynamically inserted here -->
+
+    </div>
 
 <script>
     const NVIDIA_GREEN = "{{ COLORS.safe }}";
@@ -430,6 +501,12 @@ HTML_TEMPLATE = """
         text_bright: "{{ COLORS.text_bright }}"
     };
 
+    function getColorForValue(val) {
+        if (val > DANGER_THRESHOLD) return COLORS.danger;
+        if (val > WARNING_THRESHOLD) return COLORS.warning;
+        return NVIDIA_GREEN;
+    }
+
     function drawGauge(canvasId, percentage, color, thin=false) {
         const canvas = document.getElementById(canvasId);
         if (!canvas) return;
@@ -437,9 +514,9 @@ HTML_TEMPLATE = """
         const cx = canvas.width / 2;
         const cy = canvas.height / 2;
         const radius = thin ? canvas.width * 0.4 : canvas.width * 0.42;
-        const lineWidth = thin ? 8 : 15;
-        const startAngle = -Math.PI; 
-        const endAngle = 0; 
+        const lineWidth = thin ? 8 : 12;
+        const startAngle = -Math.PI;
+        const endAngle = 0;
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.beginPath();
@@ -454,7 +531,7 @@ HTML_TEMPLATE = """
             ctx.beginPath();
             ctx.arc(cx, cy, radius, startAngle, currentAngle);
             ctx.lineWidth = lineWidth;
-            ctx.strokeStyle = percentage > DANGER_THRESHOLD ? COLORS.danger : percentage > WARNING_THRESHOLD ? COLORS.warning : color;
+            ctx.strokeStyle = color;
             ctx.lineCap = 'round';
             ctx.stroke();
         }
@@ -467,33 +544,32 @@ HTML_TEMPLATE = """
         const width = canvas.width;
         const height = canvas.height;
         const padding = 5;
-        
-        ctx.clearRect(0, 0, width, height);
-        if (dataPoints.length < 2) return;
 
+        ctx.clearRect(0, 0, width, height);
+        if (!dataPoints || dataPoints.length < 2) return;
+
+        // Gradient fill
+        let gradient = ctx.createLinearGradient(0, 0, 0, height);
+        gradient.addColorStop(0, color + "44");
+        gradient.addColorStop(1, color + "00");
+
+        ctx.fillStyle = gradient;
         ctx.beginPath();
         ctx.moveTo(0, height);
         const step = width / (dataPoints.length - 1);
-        
-        let gradient = ctx.createLinearGradient(0, 0, 0, height);
-        gradient.addColorStop(0, color + "66");
-        gradient.addColorStop(1, color + "00"); 
-
-        ctx.fillStyle = gradient;
-        ctx.moveTo(0, height);
         for (let i = 0; i < dataPoints.length; i++) {
-            const val = dataPoints[i];
-            const y = height - (val / 100 * (height - padding*2) + padding);
+            const y = height - (dataPoints[i] / 100 * (height - padding*2) + padding);
             ctx.lineTo(i * step, y);
         }
         ctx.lineTo(width, height);
+        ctx.closePath();
         ctx.fill();
 
+        // Line
         ctx.beginPath();
         for (let i = 0; i < dataPoints.length; i++) {
-            const val = dataPoints[i];
-            const y = height - (val / 100 * (height - padding*2) + padding);
-            if (i===0) ctx.moveTo(i * step, y);
+            const y = height - (dataPoints[i] / 100 * (height - padding*2) + padding);
+            if (i === 0) ctx.moveTo(i * step, y);
             else ctx.lineTo(i * step, y);
         }
         ctx.strokeStyle = color;
@@ -503,19 +579,41 @@ HTML_TEMPLATE = """
 
     function updateCpuCores(coresData) {
         const container = document.getElementById('cpuCoresContainer');
+        
+        // 首次加载时创建所有核心柱
         if (container.children.length === 0) {
             coresData.forEach((_, index) => {
                 const wrapper = document.createElement('div');
-                wrapper.innerHTML = `<div class="core-bar-container"><div class="core-bar-fill" id="coreBar${index}"></div></div>`;
+                wrapper.className = 'core-bar-container';
+                wrapper.title = `Core ${index}: 0%`;
+                wrapper.innerHTML = `<div class="core-bar-fill" id="coreBar${index}" style="height: 2%;"></div>`;
                 container.appendChild(wrapper);
             });
         }
+        
+        // 更新每个核心的负载和颜色
         coresData.forEach((usage, index) => {
-            const bar = document.getElementById(`coreBar${index}`);
-            if (bar) {
-                 bar.style.height = usage + "%";
-                 bar.style.backgroundColor = usage > DANGER_THRESHOLD ? "var(--danger)" : usage > WARNING_THRESHOLD ? COLORS.warning : "var(--nvidia-green)";
+            const wrapper = container.children[index];
+            if (!wrapper) return;
+            
+            const bar = wrapper.querySelector('.core-bar-fill');
+            if (!bar) return;
+            
+            // 最小高度 2%，确保 0% 时也能看见
+            const height = Math.max(2, usage);
+            bar.style.height = height + '%';
+            
+            // 颜色随负载变化
+            if (usage > DANGER_THRESHOLD) {
+                bar.style.backgroundColor = 'var(--danger)';
+            } else if (usage > WARNING_THRESHOLD) {
+                bar.style.backgroundColor = COLORS.warning;
+            } else {
+                bar.style.backgroundColor = 'var(--nvidia-green)';
             }
+            
+            // 鼠标悬停显示核心编号和负载
+            wrapper.title = `Core ${index}: ${usage.toFixed(1)}%`;
         });
     }
 
@@ -523,11 +621,107 @@ HTML_TEMPLATE = """
         const tbody = document.getElementById('procTable');
         let html = '';
         procs.forEach(p => {
-            html += `<tr><td>${p.username}</td><td class="proc-name">${p.name.substring(0, 20)}</td><td style="text-align:right">${p.cpu_percent.toFixed(0)}%</td><td style="text-align:right" class="proc-mem">${p.memory_percent.toFixed(1)}%</td></tr>`;
+            html += `<tr><td>${p.username || '-'}</td><td class="proc-name">${(p.name || '').substring(0, 20)}</td><td style="text-align:right">${p.cpu_percent.toFixed(0)}%</td><td style="text-align:right" class="proc-mem">${p.memory_percent.toFixed(1)}%</td></tr>`;
         });
         tbody.innerHTML = html;
     }
 
+    // --- GPU CARD MANAGEMENT ---
+    let gpuCardsCreated = false;
+
+    function createGpuCards(gpuCount) {
+        const dashboard = document.getElementById('dashboard');
+        for (let i = 0; i < gpuCount; i++) {
+            const card = document.createElement('div');
+            card.className = 'card gpu-card';
+            card.id = `gpuCard${i}`;
+            card.innerHTML = `
+                <div class="card-header">
+                    <span class="card-title">GPU ${i}</span>
+                    <span class="card-subtitle" id="gpuName${i}">Initializing...</span>
+                </div>
+                <div class="gauge-container">
+                    <div class="gauge-wrapper">
+                        <canvas id="gpuUtilGauge${i}" class="gauge" width="120" height="120"></canvas>
+                        <div class="big-value-container">
+                            <span class="gpu-big-value" id="gpuUtilVal${i}">0</span><span class="big-unit">%</span>
+                            <div class="sub-value">Compute</div>
+                        </div>
+                    </div>
+                    <div class="gauge-wrapper">
+                        <canvas id="vramGauge${i}" class="gauge" width="120" height="120"></canvas>
+                        <div class="big-value-container">
+                            <span class="gpu-big-value" id="vramVal${i}">0</span><span class="big-unit">GB</span>
+                            <div class="sub-value" id="vramTotal${i}">of 0 GB</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="metrics-grid">
+                    <div class="metric-box">
+                        <span class="label">TEMP</span>
+                        <span class="value" id="gpuTemp${i}">0</span><span class="unit">°C</span>
+                    </div>
+                    <div class="metric-box">
+                        <span class="label">POWER</span>
+                        <span class="value" id="gpuPower${i}">0</span><span class="unit">W</span>
+                    </div>
+                    <div class="metric-box">
+                        <span class="label">FAN</span>
+                        <span class="value" id="gpuFan${i}">0</span><span class="unit">%</span>
+                    </div>
+                </div>
+                <div style="margin-top:10px;">
+                    <div class="graph-label">GPU ${i} Load History (60s)</div>
+                    <canvas id="gpuGraph${i}" class="graph" width="400" height="60"></canvas>
+                </div>
+            `;
+            dashboard.appendChild(card);
+        }
+        gpuCardsCreated = true;
+    }
+
+    function updateGpuCards(gpuData) {
+        if (!gpuData.available || !gpuData.devices) return;
+
+        if (!gpuCardsCreated) {
+            createGpuCards(gpuData.count);
+        }
+
+        gpuData.devices.forEach((gpu, i) => {
+            if (!gpu.available) return;
+
+            // Update name in header (only first time)
+            const nameEl = document.getElementById(`gpuName${i}`);
+            if (nameEl && nameEl.innerText === 'Initializing...') {
+                nameEl.innerText = gpu.name;
+            }
+
+            const utilColor = getColorForValue(gpu.utilization);
+            const vramColor = getColorForValue(gpu.vram_percent);
+
+            drawGauge(`gpuUtilGauge${i}`, gpu.utilization, utilColor);
+            document.getElementById(`gpuUtilVal${i}`).innerText = gpu.utilization;
+
+            drawGauge(`vramGauge${i}`, gpu.vram_percent, vramColor);
+            document.getElementById(`vramVal${i}`).innerText = gpu.vram_used_gb;
+            document.getElementById(`vramTotal${i}`).innerText = `of ${gpu.vram_total_gb} GB`;
+
+            drawGraph(`gpuGraph${i}`, gpu.history, GRAPH_BLUE);
+
+            document.getElementById(`gpuTemp${i}`).innerText = gpu.temp_c || '-';
+            document.getElementById(`gpuFan${i}`).innerText = gpu.fan_percent || '-';
+
+            const powerEl = document.getElementById(`gpuPower${i}`);
+            if (gpu.power_limit_w) {
+                const pct = (gpu.power_w / gpu.power_limit_w) * 100;
+                powerEl.innerHTML = `<span style="color:${getColorForValue(pct)}">${gpu.power_w}/${gpu.power_limit_w}</span>`;
+            } else {
+                powerEl.innerText = gpu.power_w || '-';
+            }
+        });
+    }
+
+    // --- MAIN UPDATE LOOP ---
     let isFirstLoad = true;
 
     async function updateDashboard() {
@@ -538,58 +732,46 @@ HTML_TEMPLATE = """
             if (isFirstLoad) {
                 document.getElementById('osInfo').innerText = data.os;
                 document.getElementById('cpuCountInfo').innerHTML = `
-                    <div style="font-size:0.8rem; color:var(--text-bright); margin-bottom:2px;">${data.cpu.model}</div>
+                    <div style="font-size:0.75rem; color:var(--text-bright); margin-bottom:2px;">${data.cpu.model}</div>
                     ${data.cpu.count_physical} Phys / ${data.cpu.count_logical} Log
                 `;
-                
-                if (data.gpu.available) document.getElementById('gpuName').innerText = data.gpu.name;
                 isFirstLoad = false;
             }
 
-            drawGauge('cpuGauge', data.cpu.global_usage, NVIDIA_GREEN);
+            // CPU
+            drawGauge('cpuGauge', data.cpu.global_usage, getColorForValue(data.cpu.global_usage));
             document.getElementById('cpuVal').innerText = data.cpu.global_usage.toFixed(1);
             drawGraph('cpuGraph', data.cpu.history, GRAPH_BLUE);
             updateCpuCores(data.cpu.cores);
 
-            drawGauge('ramGauge', data.memory.ram_percent, NVIDIA_GREEN);
+            // RAM
+            drawGauge('ramGauge', data.memory.ram_percent, getColorForValue(data.memory.ram_percent));
             document.getElementById('ramVal').innerText = data.memory.ram_used_gb;
             document.getElementById('ramTotal').innerText = `of ${data.memory.ram_total_gb} GB`;
 
-            drawGauge('ssdGauge', data.storage.root_percent, NVIDIA_GREEN, true);
+            // Storage
+            drawGauge('ssdGauge', data.storage.root_percent, getColorForValue(data.storage.root_percent), true);
             document.getElementById('ssdVal').innerText = data.storage.root_percent;
             document.getElementById('ssdUsed').innerText = data.storage.root_used_gb;
             document.getElementById('ssdTotal').innerText = data.storage.root_total_gb;
 
-            drawGauge('swapGauge', data.memory.swap_percent, NVIDIA_GREEN, true);
+            // Swap
+            drawGauge('swapGauge', data.memory.swap_percent, getColorForValue(data.memory.swap_percent), true);
             document.getElementById('swapVal').innerText = data.memory.swap_percent.toFixed(1);
             document.getElementById('swapUsed').innerText = data.memory.swap_used_gb;
             document.getElementById('swapTotal').innerText = data.memory.swap_total_gb;
 
+            // Processes
             updateProcessTable(data.processes);
 
-            const gpuCard = document.getElementById('gpuCard');
-            if (data.gpu && data.gpu.available) {
-                gpuCard.style.opacity = "1";
-                drawGauge('gpuUtilGauge', data.gpu.utilization, NVIDIA_GREEN);
-                document.getElementById('gpuUtilVal').innerText = data.gpu.utilization;
-                drawGauge('vramGauge', data.gpu.vram_percent, NVIDIA_GREEN);
-                document.getElementById('vramVal').innerText = data.gpu.vram_used_gb;
-                document.getElementById('vramTotal').innerText = `of ${data.gpu.vram_total_gb} GB`;
-                drawGraph('gpuGraph', data.gpu.history, GRAPH_BLUE);
-                document.getElementById('gpuTemp').innerText = data.gpu.temp_c;
-                const powerPercentage = data.gpu.power_limit_w ? (data.gpu.power_w / data.gpu.power_limit_w) * 100 : 0;
-                const powerColor = powerPercentage > DANGER_THRESHOLD ? COLORS.danger : powerPercentage > WARNING_THRESHOLD ? COLORS.warning : COLORS.text_bright;
-                document.getElementById('gpuPower').innerHTML = data.gpu.power_limit_w ? `<span style="color: ${powerColor}">${data.gpu.power_w} / ${data.gpu.power_limit_w}</span>` : data.gpu.power_w;
-                document.getElementById('gpuFan').innerText = data.gpu.fan_percent;
-                document.getElementById('gpuDriver').innerText = data.gpu.driver;
-                document.getElementById('pcieTx').innerText = data.gpu.pcie_tx_mb;
-                document.getElementById('pcieRx').innerText = data.gpu.pcie_rx_mb;
-            } else {
-                gpuCard.style.opacity = "0.5";
-                document.getElementById('gpuName').innerText = "NO NVIDIA GPU";
-            }
-        } catch (e) { console.error(e); }
+            // GPUs
+            updateGpuCards(data.gpu);
+
+        } catch (e) {
+            console.error('Dashboard update error:', e);
+        }
     }
+
     setInterval(updateDashboard, {{ UPDATE_INTERVAL }});
     updateDashboard();
 </script>
@@ -612,7 +794,5 @@ def full_stats():
     return jsonify(monitor.get_full_stats())
 
 if __name__ == "__main__":
-    # In PROD, this block is ignored by Gunicorn.
-    # It allows easy local testing.
     print(f"Monitoring available at http://{HOST}:{PORT}")
     app.run(host=HOST, port=PORT, threaded=True)

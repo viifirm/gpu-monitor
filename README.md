@@ -1,5 +1,22 @@
 # ⚡ AI Workstation Monitor
 
+## This is a modified version
+
+I change the project to more adapt to windows rather than Linux. Using `requirements.txt` rather than `uv`. 
+
+- Support multiple GPUs
+- In Windows will automatic using waitress instead of gunicorn
+- fixing the display problem of too many logical cores
+
+```powershell
+python -m venv venv
+.\venv\Scripts\activate
+pip install -r requirements.txt
+waitress-serve --port=9999 main:app
+```
+
+below is the original project files
+
 ![Python](https://img.shields.io/badge/Python-3.12%2B-blue)
 ![Manager](https://img.shields.io/badge/uv-Astral-purple)
 ![License](https://img.shields.io/badge/License-MIT-green)
